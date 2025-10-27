@@ -10,19 +10,25 @@ on:
 jobs:
   tests:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Upgrade pip and install test deps
+
+      - name: Install test dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pytest
+          pip install -r requirements-test.txt
+        # requirements-test.txt содержит pytest и torch (CPU-колёса)
+
       - name: Install package (editable)
-        run: |
-          pip install -e .
+        run: pip install -e .
+        # editable-установка обеспечивает корректные импорты tiny_transformer
+
       - name: Run tests
         run: pytest -q
