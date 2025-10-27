@@ -63,3 +63,34 @@ def test_generate_appends_expected_length():
     prompt = torch.randint(0, config.vocab_size, (1, 4))
     output = model.generate(prompt, max_new_tokens=3)
     assert output.shape == (1, prompt.shape[1] + 3)
+
+
+def test_mlp_forward_shapes():
+    config = tt.MLPConfig(
+        vocab_size=6,
+        block_size=8,
+        n_embd=8,
+        hidden_size=32,
+        n_layers=2,
+        dropout=0.0,
+    )
+    model = tt.MLPLanguageModel(config)
+    idx = torch.randint(0, config.vocab_size, (2, config.block_size))
+    logits, loss = model(idx, idx)
+    assert logits.shape == (2, config.block_size, config.vocab_size)
+    assert loss is not None
+
+
+def test_mlp_generate_appends_expected_length():
+    config = tt.MLPConfig(
+        vocab_size=5,
+        block_size=6,
+        n_embd=8,
+        hidden_size=16,
+        n_layers=1,
+        dropout=0.0,
+    )
+    model = tt.MLPLanguageModel(config)
+    prompt = torch.randint(0, config.vocab_size, (1, 4))
+    output = model.generate(prompt, max_new_tokens=3)
+    assert output.shape == (1, prompt.shape[1] + 3)
