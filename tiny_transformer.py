@@ -66,6 +66,16 @@ class ModelConfig:
     dropout: float = 0.1
 
 
+@dataclass
+class MLPConfig:
+    vocab_size: int
+    block_size: int = 64
+    n_embd: int = 64
+    hidden_size: int = 256
+    n_layers: int = 2
+    dropout: float = 0.1
+
+
 class FeedForward(nn.Module):
     def __init__(self, n_embd: int, dropout: float):
         super().__init__()
@@ -182,6 +192,71 @@ class TransformerLM(nn.Module):
         return idx
 
 
+class MLPLanguageModel(nn.Module):
+    def __init__(self, config: MLPConfig):
+        super().__init__()
+        self.config = config
+        self.token_embedding = nn.Embedding(config.vocab_size, config.n_embd)
+        input_dim = config.block_size * config.n_embd
+
+        layers = []
+        in_dim = input_dim
+        for _ in range(config.n_layers):
+            layers.extend(
+                [
+                    nn.Linear(in_dim, config.hidden_size),
+                    nn.GELU(),
+                    nn.Dropout(config.dropout),
+                ]
+            )
+            in_dim = config.hidden_size
+        layers.append(nn.Linear(in_dim, config.block_size * config.vocab_size))
+        self.mlp = nn.Sequential(*layers)
+
+        self.apply(self._init_weights)
+
+    @staticmethod
+    def _init_weights(module: nn.Module) -> None:
+        if isinstance(module, (nn.Linear, nn.Embedding)):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        if isinstance(module, nn.Linear) and module.bias is not None:
+            nn.init.zeros_(module.bias)
+
+    def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None) -> Tuple[torch.Tensor, torch.Tensor | None]:
+        B, T = idx.shape
+        if T > self.config.block_size:
+            raise ValueError(
+                f"Cannot forward sequence of length {T}, block_size is {self.config.block_size}"
+            )
+
+        tokens = self.token_embedding(idx)
+        if T < self.config.block_size:
+            pad_len = self.config.block_size - T
+            pad = torch.zeros(B, pad_len, self.config.n_embd, device=tokens.device, dtype=tokens.dtype)
+            tokens = torch.cat([tokens, pad], dim=1)
+
+        tokens = tokens[:, : self.config.block_size, :]
+        flat = tokens.reshape(B, self.config.block_size * self.config.n_embd)
+        logits_full = self.mlp(flat).view(B, self.config.block_size, self.config.vocab_size)
+        logits = logits_full[:, :T, :]
+
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(logits.reshape(B * T, -1), targets.view(B * T))
+        return logits, loss
+
+    @torch.no_grad()
+    def generate(self, idx: torch.Tensor, max_new_tokens: int, temperature: float = 1.0) -> torch.Tensor:
+        for _ in range(max_new_tokens):
+            idx_cond = idx[:, -self.config.block_size :]
+            logits, _ = self(idx_cond)
+            logits = logits[:, -1, :] / max(temperature, 1e-6)
+            probs = F.softmax(logits, dim=-1)
+            next_idx = torch.multinomial(probs, num_samples=1)
+            idx = torch.cat([idx, next_idx], dim=1)
+        return idx
+
+
 @dataclass
 class TrainConfig:
     batch_size: int = 16
@@ -247,16 +322,7 @@ def train(corpus: str, args: argparse.Namespace) -> None:
         device=args.device,
     )
 
-    model_cfg = ModelConfig(
-        vocab_size=tokenizer.vocab_size,
-        block_size=args.block_size,
-        n_embd=args.n_embd,
-        n_head=args.n_head,
-        n_layer=args.n_layer,
-        dropout=args.dropout,
-    )
-
-    model = TransformerLM(model_cfg).to(train_cfg.device)
+    model = build_model(args, tokenizer.vocab_size).to(train_cfg.device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=train_cfg.lr)
 
     for step in range(train_cfg.max_iters + 1):
@@ -271,6 +337,7 @@ def train(corpus: str, args: argparse.Namespace) -> None:
         torch.nn.utils.clip_grad_norm_(model.parameters(), train_cfg.grad_clip)
         optimizer.step()
 
+    model.eval()
     prompt = torch.tensor([[tokenizer.stoi[next(iter(tokenizer.stoi))]]], device=train_cfg.device)
     generated = model.generate(prompt, max_new_tokens=args.sample_tokens, temperature=args.temperature)
     text = tokenizer.decode(generated[0].tolist())
@@ -280,6 +347,7 @@ def train(corpus: str, args: argparse.Namespace) -> None:
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train a tiny Transformer language model")
+    parser.add_argument("--model", type=str, choices=["transformer", "mlp"], default="transformer", help="Architecture to train")
     parser.add_argument("--text-path", type=Path, default=None, help="Optional path to a custom training corpus")
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--block-size", type=int, default=64)
@@ -291,11 +359,37 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--n-head", type=int, default=4)
     parser.add_argument("--n-layer", type=int, default=2)
     parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument("--mlp-hidden", type=int, default=256, help="Hidden layer size for the MLP baseline")
+    parser.add_argument("--mlp-layers", type=int, default=2, help="Number of hidden layers in the MLP baseline")
     parser.add_argument("--sample-tokens", type=int, default=200, help="Number of new tokens to sample after training")
     parser.add_argument("--temperature", type=float, default=1.0, help="Sampling temperature")
     parser.add_argument("--seed", type=int, default=1337)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", choices=["cpu", "cuda"])
     return parser
+
+
+def build_model(args: argparse.Namespace, vocab_size: int) -> nn.Module:
+    if args.model == "transformer":
+        model_cfg = ModelConfig(
+            vocab_size=vocab_size,
+            block_size=args.block_size,
+            n_embd=args.n_embd,
+            n_head=args.n_head,
+            n_layer=args.n_layer,
+            dropout=args.dropout,
+        )
+        return TransformerLM(model_cfg)
+    if args.model == "mlp":
+        mlp_cfg = MLPConfig(
+            vocab_size=vocab_size,
+            block_size=args.block_size,
+            n_embd=args.n_embd,
+            hidden_size=args.mlp_hidden,
+            n_layers=args.mlp_layers,
+            dropout=args.dropout,
+        )
+        return MLPLanguageModel(mlp_cfg)
+    raise ValueError(f"Unknown model type: {args.model}")
 
 
 def main() -> None:
